@@ -1,7 +1,7 @@
-# Data Requirements Log  
-Strategy: Quality, Dividend & Sentiment Composite Strategy  
-History Requirement: Minimum 5 years backfill  
-Query Requirement: Must support retrieval by company and by year  
+# Data Requirements Log
+**Strategy:** Quality, Dividend & Sentiment Composite Strategy
+**History Requirement:** Minimum 5 years backfill
+**Query Requirement:** Must support retrieval by company and by year
 
 ---
 
@@ -10,131 +10,120 @@ Query Requirement: Must support retrieval by company and by year
 | Field | Specification |
 |------|--------------|
 | Metric Name | Dividend Yield |
-| Raw Fields | Dividend Per Share (DPS), Market Price |
-| Source System | PostgreSQL |
-| Source Tables | financials (DPS), market_data (Price) |
-| Frequency | Monthly (computed using latest available dividend) |
+| Raw Fields | Dividend Per Share (DPS), Adjusted Close Price |
+| Origin Source (Input) | External API (`yfinance`) |
+| Target Storage (Output) | PostgreSQL (`systematic_equity.factor_observations`) |
+| Frequency | Monthly (computed using latest available dividend at month-end) |
 | History | ≥ 5 years |
-| Calculation Logic | Dividend Yield = Annualized DPS / Price |
+| Calculation Logic | Dividend Yield = (Trailing 12-Month Total DPS) / Price |
 
-### Missing / Quality Rule
-- Price must be available within the previous 3 trading days (Strictly backward-looking).
-- If DPS missing:
-  - Use latest declared dividend within last 12 months.
-  - If no dividend in last 12 months → set Dividend Yield = 0.
-- If Price ≤ 0 → drop observation.
-- No forward-fill allowed for Price beyond 3 trading days.
-- Log quality flag if stale dividend used.
+### Missing / Error Tolerance & Quality Rules
+- **Look-ahead Bias Prevention:** Price must be queried strictly backward-looking. Use the exact date's close. If the exact date falls on a weekend/holiday, fall back to the most recent trading day, **maximum 3 trading days prior (-3 to 0 days)**. Future prices (+1 to +3 days) are strictly forbidden.
+- **Missing DPS Tolerance:** If dividend history is missing or no dividends were declared within the last 12 months, do NOT drop the observation. Set `Dividend Yield = 0.0`.
+- **Missing Price Tolerance:** If `Adjusted Close Price` is missing, NaN, or ≤ 0 after the 3-day backward look, **DROP** the observation for that specific date to avoid zero-division errors.
+- **Quality Auditing:** Log a warning (`flag_stale_price = True`) if a price older than 1 trading day is used.
 
 ---
 
-## 2. Return on Equity (ROE)
+## 2. EBITDA Margin (Profitability Factor)
 
 | Field | Specification |
 |------|--------------|
-| Metric Name | ROE |
-| Raw Fields | Net Income, Shareholder Equity |
-| Source System | PostgreSQL |
-| Source Tables | financials |
-| Frequency | Quarterly |
+| Metric Name | EBITDA Margin |
+| Raw Fields | `enterprise_ebitda`, `enterprise_revenue`, `end_date` |
+| Origin Source (Input) | Internal PostgreSQL (`systematic_equity` static tables) |
+| Target Storage (Output) | PostgreSQL (`systematic_equity.factor_observations`) |
+| Frequency | Quarterly/Annual (aligned with internal table updates) |
 | History | ≥ 5 years |
-| Calculation Logic | ROE = Net Income / Shareholder Equity |
+| Calculation Logic | EBITDA Margin = `enterprise_ebitda` / `enterprise_revenue` |
 
-### Missing / Quality Rule
-- If Shareholder Equity ≤ 0 → drop observation.
-- Net Income or Equity may be forward-filled up to 9 months (max staleness).
-- If staleness > 9 months → drop observation and log quality flag.
-- No interpolation allowed.
+### Missing / Error Tolerance & Quality Rules
+- **Negative Revenue:** If `enterprise_revenue` ≤ 0, **DROP** the observation (margins on zero/negative revenue are mathematically meaningless).
+- **Missing Values:** If either `enterprise_ebitda` or `enterprise_revenue` is NULL/NaN, **DROP** the observation. Do not attempt to impute EBITDA.
+- **Staleness Limit:** Data from the internal table must be forward-filled on a daily/monthly basis for portfolio alignment. The maximum allowed staleness from the internal `end_date` is **12 months**.
+- **Expiration:** If the latest available `end_date` is older than 12 months relative to the calculation date, **DROP** the observation and log a `Data_Expired` flag.
 
 ---
 
-## 3. Debt/Equity Ratio
+## 3. Debt/Equity Ratio (Financial Health Factor)
 
 | Field | Specification |
 |------|--------------|
 | Metric Name | Debt/Equity |
-| Raw Fields | Total Debt, Short-term Debt, Long-term Debt, Shareholder Equity |
-| Source System | PostgreSQL |
-| Source Tables | financials |
+| Raw Fields | Total Debt (Short-term + Long-term), `book_value` |
+| Origin Source (Input) | **Mixed:** External API (`yfinance` for Debt) + Internal PostgreSQL (`book_value`) |
+| Target Storage (Output) | PostgreSQL (`systematic_equity.factor_observations`) |
 | Frequency | Quarterly |
 | History | ≥ 5 years |
-| Calculation Logic | Debt/Equity = Total Debt / Shareholder Equity |
+| Calculation Logic | Debt/Equity = Total Debt / `book_value` |
 
-### Missing / Quality Rule
-- If Total Debt missing:
-  - Compute as Short-term Debt + Long-term Debt.
-- If Shareholder Equity ≤ 0 → drop observation.
-- Debt components may be forward-filled up to 9 months.
-- If debt missing beyond 9 months → drop and log quality flag.
+### Missing / Error Tolerance & Quality Rules
+- **Missing Debt Fallback:** If `Total Debt` is missing directly from the API, attempt to calculate it as `Short-term Debt + Long-term Debt`. If both are missing, **DROP** the observation.
+- **Negative Equity:** If internal `book_value` ≤ 0, **DROP** the observation. Highly distressed companies with negative equity produce misleading D/E ratios.
+- **Cross-Source Staleness Limit:** External Debt and Internal Book Value may be published on different dates. Both components may be forward-filled up to a maximum of **9 months** from their respective report dates.
+- **Interpolation:** Strict **NO**. Step-forward fill only.
 
 ---
 
-## 4. P/E Ratio
+## 4. Price-to-Book Ratio (P/B) (Valuation Factor)
 
 | Field | Specification |
 |------|--------------|
-| Metric Name | P/E |
-| Raw Fields | Market Price, EPS (Trailing Twelve Months preferred) |
-| Source System | PostgreSQL |
-| Source Tables | market_data (Price), financials (EPS) |
+| Metric Name | P/B Ratio |
+| Raw Fields | Adjusted Close Price, `outstanding_shares`, `book_value` |
+| Origin Source (Input) | **Mixed:** External API (`Price`) + Internal PostgreSQL (`outstanding_shares`, `book_value`) |
+| Target Storage (Output) | PostgreSQL (`systematic_equity.factor_observations`) |
 | Frequency | Monthly |
 | History | ≥ 5 years |
-| Calculation Logic | P/E = Price / EPS |
+| Calculation Logic | P/B = (Price * `outstanding_shares`) / `book_value` |
 
-### Missing / Quality Rule
-- Price must be available within ±3 trading days.
-- EPS may be forward-filled up to 12 months.
-- If EPS = 0 or negative → drop observation.
-- If EPS missing beyond 12 months → drop.
-- Log quality flag if EPS is stale.
+### Missing / Error Tolerance & Quality Rules
+- **Look-ahead Bias Prevention:** Price must strictly utilize the [-3 to 0 days] backward-looking rule.
+- **Negative Equity:** If internal `book_value` ≤ 0, **DROP** the observation.
+- **Missing Shares:** If `outstanding_shares` is missing, NaN, or ≤ 0, **DROP** the observation (market cap cannot be calculated).
+- **Staleness Limit:** Internal fundamental data (`book_value`, `outstanding_shares`) may be forward-filled up to **12 months**.
+- **Extreme Values Cap:** Cap P/B ratios at the 99th percentile (e.g., P/B > 100) to prevent data anomalies from skewing Z-score calculations in Coursework 2.
 
 ---
 
-## 5. News Sentiment Score
+## 5. News Sentiment Score (Alternative Risk Factor)
 
 | Field | Specification |
 |------|--------------|
-| Metric Name | News Sentiment Score |
-| Raw Fields | Article Sentiment Score |
-| Source System | Alpha Vantage API |
-| Source | NEWS_SENTIMENT |
-| Frequency | Daily (aggregated to monthly for portfolio construction) |
-| History | ≥ 5 years (where available) |
-| Calculation Logic | Average sentiment score over rolling 30-day window |
+| Metric Name | News Sentiment |
+| Raw Fields | Article Sentiment Score, Timestamp |
+| Origin Source (Input) | External API (e.g., Alpha Vantage `NEWS_SENTIMENT` or NewsAPI) |
+| Target Storage (Output) | MinIO (Raw JSON) → PostgreSQL (`factor_observations`) |
+| Frequency | Daily (aggregated to monthly for portfolio rebalancing) |
+| History | ≥ 5 years (where available depending on API limits) |
+| Calculation Logic | Simple Average of sentiment scores over a rolling 30-day window. |
 
-### Missing / Quality Rule
-- If no news available in 30-day window → assign score = 0 (neutral).
-- Do not drop observation due to missing news.
-- Cap extreme sentiment scores to [-1, +1].
-- Log count of articles used per window for audit.
+### Missing / Error Tolerance & Quality Rules
+- **Zero News Fallback:** If NO news articles are found for a given company within the trailing 30-day window, **DO NOT DROP** the observation. Assign a neutral sentiment score of **0.0**.
+- **Data Capping:** Hard cap all computed sentiment scores to a range of `[-1.0, 1.0]`.
+- **Audit Logging:** The system must record `article_count_30d` as a secondary metadata column alongside the score to distinguish between a "0.0 due to no news" vs a "0.0 due to mixed news".
 
 ---
 
-# Acceptance Criteria (System-Level)
+# System-Level Acceptance Criteria (Definition of Done)
 
-The following criteria must be verifiable via automated tests:
+The pipeline and infrastructure must pass the following verifiable automated criteria before pull requests can be merged.
 
-### Data Coverage
-- Each metric must contain ≥ 5 years of historical data for ≥ 3 companies.
-- Missing observations must respect defined staleness limits.
+### 1. Data Coverage & Integrity Tests (`pytest`)
+- **Historical Depth:** Pipeline must successfully backfill and persist ≥ 5 years of data for at least 3 test companies without throwing unhandled exceptions.
+- **Missing Data Enforcement:** Unit tests must inject mocked stale data (e.g., Book Value > 12 months old) and explicitly assert that the ETL pipeline drops the observation.
+- **Test Coverage Red Line:** The `pytest` suite running over the `transform` and `quality` modules must achieve a minimum of **80% code coverage**.
 
-### Query Capability
-System must support:
+### 2. Query Capability & Indexing
+- **EAV / Long Table Pattern:** The `factor_observations` schema must be designed as a "long table" (e.g., `company_id`, `as_of_date`, `factor_name`, `factor_value`) rather than a wide table, satisfying the requirement that *adding a new metric must not require a schema ALTER operation*.
+- **Performance:** B-Tree indexes must be applied to `company_id` and `as_of_date`. The database must support sub-second query execution times for:
+  1. Retrieving all metrics for a single `company_id` over a 5-year period.
+  2. Retrieving a specific `factor_name` across all companies for a given calendar year.
 
-1. Query all metrics for a single company over a 5-year period.
-2. Query a single metric across all companies for a given calendar year.
+### 3. Pipeline Robustness & Fault Tolerance
+- **Dynamic Universe:** The pipeline must dynamically query `systematic_equity.company_static` at runtime. Adding or removing a symbol from this table must immediately reflect in the pipeline's execution loop without requiring codebase changes.
+- **Idempotency & Uniqueness:** The pipeline must be idempotent. Rerunning the pipeline for the same date range must not duplicate data. PostgreSQL must utilize a composite Unique Constraint (`company_id`, `factor_name`, `as_of_date`) combined with an `INSERT ... ON CONFLICT DO UPDATE` (Upsert) strategy.
+- **Non-Blocking Execution:** If the API request for `company A` fails (e.g., HTTP 404 or 500), the pipeline must catch the exception, log the error trace to a `pipeline_runs` audit table, and seamlessly continue processing `company B`.
 
-### Uniqueness
-- No duplicate keys allowed for (company_id, metric_name, as_of_date).
-
-### Flexibility
-- Adding a new company must not require schema change.
-- Adding a new metric must not require altering factor_observations schema.
-
-### Quality Flags
-- Stale data usage must be logged.
-- Dropped observations must be traceable.
-- Sentiment window article counts must be stored for audit.
-
-
-
+### 4. Quality Auditability
+- **Lineage Tracing:** Every row in the curated PostgreSQL table must include a `run_id` or `updated_at` timestamp linking it back to the specific execution batch that fetched the raw data from MinIO.
